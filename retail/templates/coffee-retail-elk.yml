@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+
+Parameters:
+  ESDomainName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9\\-]{2,27}$"
+    Default: coffee-retail-elk
+
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Join ["_", !Split ["-", !Sub "${ESDomainName}-user-pool"]]
+      UsernameAttributes:
+        - email
+        - phone_number
+      UsernameConfiguration:
+        CaseSensitive: False
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: True
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: True
+          RequireUppercase: True
+          RequireNumbers: True
+          RequireSymbols: True
+          TemporaryPasswordValidityDays: 30
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+          - Name: verified_phone_number
+            Priority: 2
+
+  UserPoolDomain:
+    DependsOn: UserPool
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref ESDomainName
+      UserPoolId: !Ref UserPool
+
+  UserPoolClientForIDPool:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      SupportedIdentityProviders: 
+        - COGNITO
+      ExplicitAuthFlows: 
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      RefreshTokenValidity: 30
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Join ["_", !Split ["-", !Sub "${ESDomainName}-id-pool"]]
+      AllowUnauthenticatedIdentities: False
+      CognitoIdentityProviders:
+        - ProviderName: !GetAtt UserPool.ProviderName
+          ClientId: !Ref UserPoolClientForIDPool
+          ServerSideTokenCheck: True
+
+  AdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Path: "/"
+      Policies:
+        - PolicyName: AllowCognito
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-sync:*
+                  - cognito-identity:*
+                  - mobileanalytics:PutEvents
+                Resource: "*"
+        - PolicyName: AllowElasticsearch
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttp*
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*
+
+  AnonymousRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Path: "/"
+      Policies:
+        - PolicyName: AllowCognito
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-sync:*
+                  - mobileanalytics:PutEvents
+                Resource: "*"
+        - PolicyName: AllowElasticsearch
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpHead
+                  - es:ESHttpGet
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*
+
+  UserPoolAdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: 
+      GroupName: AdminUsers
+      Precedence: 0
+      RoleArn: !GetAtt AdminRole.Arn
+      UserPoolId: !Ref UserPool
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        "authenticated": !GetAtt AdminRole.Arn
+        "unauthenticated": !GetAtt AnonymousRole.Arn
+
+  ElasticsearchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: es.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /service-role/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonESCognitoAccess
+
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: !Ref ESDomainName
+      ElasticsearchClusterConfig:
+        InstanceCount: 1
+        InstanceType: r5.large.elasticsearch
+      ElasticsearchVersion: 7.1
+      EBSOptions:
+        EBSEnabled: True
+        VolumeSize: 10
+        VolumeType: gp2
+      EncryptionAtRestOptions:
+        Enabled: True
+      NodeToNodeEncryptionOptions:
+        Enabled: True
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: 0
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt AdminRole.Arn
+            Action: es:*
+            Resource:
+              - !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${ESDomainName}/*
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: True
+      CognitoOptions:
+        Enabled: True
+        RoleArn: !GetAtt ElasticsearchServiceRole.Arn
+        UserPoolId: !Ref UserPool
+        IdentityPoolId: !Ref IdentityPool
